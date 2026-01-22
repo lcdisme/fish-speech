@@ -30,11 +30,15 @@ class ReferenceLoader:
         self.decoder_model: DAC
         self.encode_reference: Callable
 
-        # Define the torchaudio backend
-        backends = torchaudio.list_audio_backends()
-        if "ffmpeg" in backends:
-            self.backend = "ffmpeg"
-        else:
+        # Define the torchaudio backend (handle API changes in torchaudio 2.x)
+        try:
+            backends = torchaudio.list_audio_backends()
+            if "ffmpeg" in backends:
+                self.backend = "ffmpeg"
+            else:
+                self.backend = "soundfile"
+        except AttributeError:
+            # torchaudio 2.1+ removed list_audio_backends
             self.backend = "soundfile"
 
     def load_by_id(
@@ -110,23 +114,30 @@ class ReferenceLoader:
         """
         Load the audio data from a file or bytes.
         """
-        if len(reference_audio) > 255 or not Path(reference_audio).exists():
+        import soundfile as sf_lib
+        import librosa
+        import numpy as np
+        
+        if isinstance(reference_audio, bytes):
+            audio_data = reference_audio
+            reference_audio = io.BytesIO(audio_data)
+        elif len(reference_audio) > 255 or not Path(reference_audio).exists():
             audio_data = reference_audio
             reference_audio = io.BytesIO(audio_data)
 
-        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
-
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-
+        # 使用 soundfile 加载（避免 torchaudio 的 torchcodec 依赖问题）
+        audio, original_sr = sf_lib.read(reference_audio)
+        
+        # 转为单声道
+        if len(audio.shape) > 1:
+            audio = audio.mean(axis=1)
+        
+        # 重采样
         if original_sr != sr:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=original_sr, new_freq=sr
-            )
-            waveform = resampler(waveform)
+            audio = librosa.resample(audio, orig_sr=original_sr, target_sr=sr)
 
-        audio = waveform.squeeze().numpy()
-        return audio
+        # 确保返回 float32（MPS 不支持 float64）
+        return audio.astype(np.float32)
 
     def list_reference_ids(self) -> list[str]:
         """
