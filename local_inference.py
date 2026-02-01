@@ -122,8 +122,14 @@ def parse_args():
     parser.add_argument(
         "--subtitle-max-chars",
         type=int,
-        default=18,
-        help="每行字幕最大字符数（默认 18，确保视频字幕一行显示）"
+        default=23,
+        help="每行字幕最大字符数（默认 23，确保视频字幕一行显示）"
+    )
+    parser.add_argument(
+        "--subtitle-min-chars",
+        type=int,
+        default=3,
+        help="每行字幕最小字符数（默认 3，过短会合并到下一行）"
     )
     
     # 模型设置
@@ -275,77 +281,103 @@ def split_text_smart(text: str, max_chars: int = 200, keep_sentences_separate: b
     return segments
 
 
-def split_subtitle(text: str, start_time: float, end_time: float, max_chars: int = 18) -> List[dict]:
+def split_subtitle(text: str, start_time: float, end_time: float, max_chars: int = 23, min_chars: int = 3) -> List[dict]:
     """
-    将长字幕拆分成多个短字幕
-    按逗号/顿号等分割，根据字符数比例分配时间
+    智能拆分字幕
+    规则:
+    1. 按标点符号(，。！？；)切分
+    2. 每行最少 min_chars 个字，不够则与下一行合并
+    3. 每行最多 max_chars 个字，超出则强制换行
+    4. 移除所有标点符号
     """
     text = text.strip()
+    if not text:
+        return []
     
-    # 如果文本已经足够短，直接返回
-    if len(text) <= max_chars:
-        return [{'text': text, 'start': start_time, 'end': end_time}]
+    # 1. 按指定标点符号切分
+    # 包含中英文标点
+    split_pattern = r'([，。！？；,.!?;])'
+    raw_parts = re.split(split_pattern, text)
     
-    # 按逗号、顿号等分割
-    split_pattern = r'([,，、])'  # 英文逗号、中文逗号、顿号
-    parts = re.split(split_pattern, text)
-    
-    # 重新组合（保留标点）
-    chunks = []
-    for i in range(0, len(parts) - 1, 2):
-        chunk = parts[i]
-        if i + 1 < len(parts):
-            chunk += parts[i + 1]
-        chunk = chunk.strip()
-        if chunk:
-            chunks.append(chunk)
-    if len(parts) % 2 == 1 and parts[-1].strip():
-        chunks.append(parts[-1].strip())
-    
-    # 如果没有分割点，强制按字符数切分
-    if len(chunks) <= 1:
-        chunks = []
-        for i in range(0, len(text), max_chars):
-            chunks.append(text[i:i + max_chars])
-    
-    # 合并过短的片段，确保每段不超过 max_chars
-    merged_chunks = []
-    current = ""
-    for chunk in chunks:
-        if len(current) + len(chunk) <= max_chars:
-            current += chunk
-        else:
-            if current:
-                merged_chunks.append(current)
-            # 如果单个 chunk 超过 max_chars，强制切分
-            if len(chunk) > max_chars:
-                for j in range(0, len(chunk), max_chars):
-                    merged_chunks.append(chunk[j:j + max_chars])
-                current = ""
+    # 过滤掉标点符号，只保留文本部分作为基础原子
+    # 注意：这里我们直接丢弃了标点符号，满足"最后生成的所有字幕再去掉标点符号"的需求
+    atoms = []
+    for part in raw_parts:
+        clean_part = part.strip()
+        # 排除纯标点或空字符串
+        if clean_part and not re.match(r'^[，。！？；,.!?;]+$', clean_part):
+            atoms.append(clean_part)
+            
+    if not atoms:
+        return []
+
+    # 2. 合并过短的片段 (Min Length Constraint)
+    merged_atoms = []
+    if len(atoms) > 0:
+        current_atom = atoms[0]
+        for next_atom in atoms[1:]:
+            # 如果当前片段过短，尝试合并下一个
+            if len(current_atom) < min_chars:
+                current_atom += next_atom
             else:
-                current = chunk
-    if current:
-        merged_chunks.append(current)
+                merged_atoms.append(current_atom)
+                current_atom = next_atom
+        merged_atoms.append(current_atom)
+    else:
+        merged_atoms = atoms
+
+    # 如果最后一段仍然过短且前面有内容，尝试合并到前一段
+    if len(merged_atoms) > 1 and len(merged_atoms[-1]) < min_chars:
+        last = merged_atoms.pop()
+        merged_atoms[-1] += last
+
+    # 3. 处理过长的片段 (Max Length Constraint)
+    final_chunks = []
+    for atom in merged_atoms:
+        if len(atom) <= max_chars:
+            final_chunks.append(atom)
+        else:
+            # 强制切分
+            for i in range(0, len(atom), max_chars):
+                final_chunks.append(atom[i:i + max_chars])
     
-    # 根据字符数比例分配时间
-    total_chars = sum(len(c) for c in merged_chunks)
+    # 再次清理可能残留的空字符串，并移除句中残留的标点符号
+    cleaned_chunks = []
+    # 匹配所有常见中英文标点符号
+    punct_pattern = r'[、`~@#$%^&*()_+\-=\[\]{}\\|<>/！!？?。.,，;："\'“”‘’《》…—]+'
+    
+    for c in final_chunks:
+        # 将标点替换为空
+        cleaned = re.sub(punct_pattern, '', c).strip()
+        if cleaned:
+            cleaned_chunks.append(cleaned)
+    
+    if not cleaned_chunks:
+        return []
+
+    # 4. 根据字符数分配时间
+    total_chars = sum(len(c) for c in cleaned_chunks)
     duration = end_time - start_time
     
     result = []
     current_time = start_time
-    for chunk in merged_chunks:
-        chunk_duration = duration * (len(chunk) / total_chars) if total_chars > 0 else 0
+    
+    for chunk in cleaned_chunks:
+        # 简单的按字符比例分配时间
+        chunk_len = len(chunk)
+        chunk_duration = duration * (chunk_len / total_chars) if total_chars > 0 else 0
+        
         result.append({
-            'text': chunk.strip(),
+            'text': chunk,
             'start': current_time,
             'end': current_time + chunk_duration
         })
         current_time += chunk_duration
-    
+        
     return result
 
 
-def generate_srt(segments: List[str], segment_durations: List[float], srt_path: Path, max_chars: int = 18):
+def generate_srt(segments: List[str], segment_durations: List[float], srt_path: Path, max_chars: int = 23, min_chars: int = 3):
     """生成 SRT 字幕文件，自动拆分长字幕"""
     
     current_time = 0.0
@@ -357,7 +389,7 @@ def generate_srt(segments: List[str], segment_durations: List[float], srt_path: 
         end_time = current_time + duration
         
         # 拆分长字幕
-        sub_items = split_subtitle(text, start_time, end_time, max_chars)
+        sub_items = split_subtitle(text, start_time, end_time, max_chars, min_chars)
         
         for item in sub_items:
             start_str = format_srt_time(item['start'])
@@ -643,7 +675,7 @@ def main():
     # 生成字幕
     if args.output_srt:
         srt_path = Path(args.output_srt)
-        generate_srt(all_segments, segment_durations, srt_path, args.subtitle_max_chars)
+        generate_srt(all_segments, segment_durations, srt_path, args.subtitle_max_chars, args.subtitle_min_chars)
 
 
 if __name__ == "__main__":
